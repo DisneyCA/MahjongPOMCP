@@ -166,20 +166,6 @@ def sort_tiles(tiles: List[str]) -> List[str]:
 # =============================
 # Approximate value functions U(b) used for reward shaping and rollout evaluation (Ch. 22).
 
-def player_tiles_for_scoring(player) -> List[str]:
-    """Return all tiles used for 4 melds + 1 pair evaluation.
-
-    Kongs are treated as pungs (three tiles) for pattern checking.
-    """
-    tiles: List[str] = []
-    for meld in player.exposed:
-        if len(meld) == 4:
-            tiles.extend(meld[:3])  # treat gong as pung
-        else:
-            tiles.extend(meld)
-    tiles.extend(player.concealed)
-    return tiles
-
 def meld_score(tiles: List[str]) -> float:
     """
     Crude heuristic: how many melds (triplets/sequences) we can greedily extract.
@@ -220,14 +206,87 @@ def meld_score(tiles: List[str]) -> float:
 
     return score
 
-def hand_progress(player: "Player") -> float:
+def hand_progress(player: "Player",
+                  state: Optional["GameState"] = None,
+                  include_completion_bonus: bool = True) -> float:
     """
     Heuristic value function U(b) measuring hand quality for reward shaping.
-    Uses all tiles (exposed + concealed) to estimate progress toward winning.
-    Used in POMCP simulations for potential-based reward shaping (Ch. 22).
+
+    - Exposed melds are fixed and counted directly.
+    - meld_score is applied only to concealed tiles (approximate meld structure).
+    - Optional near-complete-hand bonus proportional to the number of tiles
+      that would complete the concealed hand with one more draw.
+    - Penalties for isolated honors, dead honors, and isolated suited tiles.
     """
-    tiles = player_tiles_for_scoring(player)
-    return meld_score(tiles)
+
+    # 1) Base: count exposed melds as already-complete
+    exposed_melds = 0
+    for meld in player.exposed:
+        if len(meld) == 3 or len(meld) == 4:
+            exposed_melds += 1
+
+    # 2) Meld structure from concealed tiles only
+    concealed_score = meld_score(player.concealed)
+    base_score = exposed_melds + concealed_score
+
+    # 3) Optional near-complete-hand bonus
+    completion_bonus = 0.0
+    if include_completion_bonus and state is not None:
+        winning_draws = count_winning_draws(player, state)
+        if winning_draws > 0:
+            completion_bonus = 0.5 * winning_draws  # tune this later
+
+    # 4) Honor penalties on concealed tiles (encourage discarding them)
+    honor_penalty = 0.0
+    counts = Counter(player.concealed)
+
+    # Single honors are weak shape
+    for t, c in counts.items():
+        if t in WINDCLASS or t in DRAGONCLASS:
+            if c == 1:
+                honor_penalty -= 0.5   # small penalty per isolated honor
+
+    # Stronger penalty for dead single honors (3+ seen publicly)
+    if state is not None:
+        seen = Counter()
+        for p in state.players:
+            for tile in p.discards:
+                seen[tile] += 1
+            for meld in p.exposed:
+                for tile in meld:
+                    seen[tile] += 1
+
+        for t, c in counts.items():
+            if c == 1 and (t in WINDCLASS or t in DRAGONCLASS) and seen[t] >= 3:
+                honor_penalty -= 2.0   # stronger penalty for dead honors
+
+    # 5) Isolation penalty for suited tiles (like Player 2's behavior)
+    isolation_penalty = 0.0
+
+    # Build ranks per suit from concealed tiles
+    suit_to_ranks: Dict[str, List[int]] = {"B": [], "C": [], "D": []}
+    for t in player.concealed:
+        r = tile_rank(t)
+        s = tile_suit(t)
+        if r is not None and s in suit_to_ranks:
+            suit_to_ranks[s].append(r)
+
+    for s, ranks in suit_to_ranks.items():
+        ranks.sort()
+        for r in ranks:
+            # Distance to nearest neighbor in same suit (excluding itself)
+            neighbors = [x for x in ranks if x != r]
+            if not neighbors:
+                dist = 10  # completely alone in this suit
+            else:
+                dist = min(abs(r - x) for x in neighbors)
+
+            # Penalize tiles that are far from any neighbor (isolated shapes)
+            if dist >= 2:
+                isolation_penalty -= 0.3  # tune magnitude as desired
+
+    return base_score + completion_bonus + honor_penalty + isolation_penalty
+
 
 def hand_potential_score(tiles: List[str], state: Optional["GameState"] = None) -> int:
     """
@@ -325,10 +384,10 @@ def ai2_discard_wind_dragon_then_isolated(state: "GameState", idx: int):
 
     hand = p.concealed
 
-    # 1) Single winds/dragons (no pair)
+    # 1) winds/dragons 
     counts = Counter(hand)
     candidates = [t for t in hand 
-                  if t in WINDCLASS + DRAGONCLASS and counts[t] == 1]
+                  if t in WINDCLASS + DRAGONCLASS]
     if candidates:
         tile = random.choice(candidates)
         hand.remove(tile)
@@ -457,14 +516,14 @@ def is_terminal_state(state: "GameState") -> bool:
     if not state.wall:
         return True
     for p in state.players:
-        if is_winning_hand_with_exposed(p.concealed, p.exposed):
+        if is_winning_concealed_only(p.concealed):
             return True
     return False
 
 def winner_index(state: "GameState") -> Optional[int]:
     """Return index of winning player, or None."""
     for i, p in enumerate(state.players):
-        if is_winning_hand_with_exposed(p.concealed, p.exposed):
+        if is_winning_concealed_only(p.concealed):
             return i
     return None
 
@@ -496,53 +555,28 @@ def draw_tile_row(codes, start_x, start_y, dx, dy, rotation=0):
 # WINNING HAND VALIDATION
 # =============================
 
-def is_winning_hand(tiles: List[str]) -> bool:
-    """Check 4 melds + 1 pair, sequences only in suits; no special hands."""
-    if len(tiles) != 14:
+
+def is_winning_concealed_only(concealed: List[str]) -> bool:
+    """
+    Check if concealed tiles can be partitioned into
+    (any number of) melds + exactly one pair.
+
+    Does NOT enforce '4 melds total'; it just uses the tile count to
+    determine how many melds are implied.
+    """
+    n = len(concealed)
+    # Need length == 2 (just a pair) or 2 mod 3 to be (k melds + 1 pair)
+    if n < 2 or (n - 2) % 3 != 0:
         return False
-    # Count tiles by (suit, rank) or honors directly
-    counts: Dict[str, int] = Counter(tiles)
+
+    target_melds = (n - 2) // 3
+    counts = Counter(concealed)
 
     # Try every possible pair
     for tile, c in list(counts.items()):
         if c >= 2:
             counts[tile] -= 2
-            if _can_form_melds(counts):
-                counts[tile] += 2
-                return True
-            counts[tile] += 2
-    return False
-
-def is_winning_hand_with_exposed(concealed: List[str], exposed: List[List[str]]) -> bool:
-    """
-    Check standard hand: total 4 melds + 1 pair,
-    where melds in `exposed` are already fixed and
-    only `concealed` tiles can be rearranged.
-    """
-    # Count exposed melds that are valid (triplet or chow)
-    exposed_melds = 0
-    for meld in exposed:
-        if len(meld) == 3 or len(meld) == 4:
-            exposed_melds += 1
-        else:
-            return False  # ignore exotic cases for now
-
-    # Total melds must be 4
-    needed_from_concealed = 4 - exposed_melds
-    if needed_from_concealed < 0:
-        return False
-
-    # Concealed tiles must be enough to form needed melds + 1 pair
-    if len(concealed) != needed_from_concealed * 3 + 2:
-        return False
-
-    counts = Counter(concealed)
-
-    # Try every possible pair in concealed
-    for tile, c in list(counts.items()):
-        if c >= 2:
-            counts[tile] -= 2
-            if _can_form_exact_melds(counts, needed_from_concealed):
+            if _can_form_exact_melds(counts, target_melds):
                 counts[tile] += 2
                 return True
             counts[tile] += 2
@@ -594,6 +628,61 @@ def _can_form_exact_melds(counts: Dict[str, int], target_melds: int) -> bool:
                 counts[t3] += 1
 
     return False
+
+def count_winning_draws(player: "Player",
+                        state: Optional["GameState"] = None) -> int:
+    """
+    Estimate how many different tiles would complete this player's concealed hand
+    with one additional draw, holding exposed melds fixed.
+
+    For each possible draw tile T, temporarily add T to the concealed tiles and
+    check if the hand can be partitioned into melds plus exactly one pair
+    (using is_winning_concealed_only). If so, that tile type is a winning draw.
+
+    If state is provided, weight each winning tile type by the number of
+    remaining copies (4 - seen). Otherwise, count each winning tile type once.
+    """
+    concealed = player.concealed
+    exposed = player.exposed  # currently unused, but kept for symmetry / future use
+
+    # If already in a winning pattern, caller can handle that separately
+    if is_winning_concealed_only(concealed):
+        return 0
+
+    # Count how many copies of each tile are already visible, if state is given
+    seen: Counter[str] = Counter()
+    if state is not None:
+        for p in state.players:
+            # all exposed tiles
+            for meld in p.exposed:
+                for t in meld:
+                    seen[t] += 1
+            # all discards
+            for t in p.discards:
+                seen[t] += 1
+        # include this player's concealed tiles as well
+        for t in concealed:
+            seen[t] += 1
+
+    total_winning = 0
+
+    for tile in ALL_TILES:
+        # Skip tiles that are fully used up, if we know
+        if state is not None and seen[tile] >= 4:
+            continue
+
+        test_concealed = concealed.copy()
+        test_concealed.append(tile)
+
+        if is_winning_concealed_only(test_concealed):
+            if state is not None:
+                remaining = 4 - seen[tile]
+                if remaining > 0:
+                    total_winning += remaining
+            else:
+                total_winning += 1
+
+    return total_winning
 
 def _can_form_melds(counts: Dict[str, int]) -> bool:
     # If all counts are zero, success
@@ -981,9 +1070,9 @@ def simulate_random_game(state: "GameState", max_steps: int = 300) -> float:
         draw_tile(state, pidx)
 
         # Auto-win in rollout if hand complete:
-        # use concealed + exposed, not a flattened 14-tile multiset.
+        # use concealed only, not concealed + exposed.
         p = state.players[pidx]
-        if is_winning_hand_with_exposed(p.concealed, p.exposed):
+        if is_winning_concealed_only(p.concealed):
             return 1.0 if pidx == 0 else 0.0
 
         # Discard according to rollout policy (heuristic per player)
@@ -1000,7 +1089,7 @@ def simulate_random_game(state: "GameState", max_steps: int = 300) -> float:
                 opp = state.players[pid]
                 test_concealed = opp.concealed.copy()
                 test_concealed.append(tile)
-                if is_winning_hand_with_exposed(test_concealed, opp.exposed):
+                if is_winning_concealed_only(test_concealed):
                     # Opponent wins on discard.
                     # If P0 fed this win, P0 gets -1; otherwise 0.
                     if pid == 0:
@@ -1067,7 +1156,7 @@ class Player0Planner:
             actions = []
 
             # Self-win (tsumo)
-            if is_winning_hand_with_exposed(p0.concealed, p0.exposed):
+            if is_winning_concealed_only(p0.concealed):
                 actions.append(P0Action("SELF_WIN", None))
 
             # Concealed gong options
@@ -1088,12 +1177,12 @@ class Player0Planner:
         
         tile, discarder = state.last_discard
         actions = []
-        base_hp = hand_progress(p0)
+        base_hp = hand_progress(p0, state)
 
         # Win (win on discard): add the discard to concealed and test
         test_concealed = p0.concealed.copy()
         test_concealed.append(tile)
-        if is_winning_hand_with_exposed(test_concealed, p0.exposed):
+        if is_winning_concealed_only(test_concealed):
             actions.append(P0Action("WIN", tile))
 
 
@@ -1138,7 +1227,7 @@ class Player0Planner:
         p0 = state.players[0]
         
         # Potential-based reward shaping: hand quality before action
-        hp_before = hand_progress(p0)
+        hp_before = hand_progress(p0, state, include_completion_bonus=not reacting)
         
         # Terminal actions
         if action.kind == "SELF_WIN" or action.kind == "WIN":
@@ -1213,7 +1302,7 @@ class Player0Planner:
                 state.current_player = next_player_idx(0)
         
         # --- Reward shaping based on change in P0's hand structure ---
-        hp_after = hand_progress(p0)
+        hp_after = hand_progress(p0, state, include_completion_bonus=not reacting)
         immediate_reward += self.shaping_alpha * (hp_after - hp_before)
         
         # Simulate other players until P0's next turn
@@ -1232,7 +1321,7 @@ class Player0Planner:
             
             # Check if opponent wins
             opp = state.players[pidx]
-            if is_winning_hand_with_exposed(opp.concealed, opp.exposed):
+            if is_winning_concealed_only(opp.concealed):
                 return 0.0, True, "OPP_WIN"
             
             # Opponent discards using same heuristic policies as the real game (no calls in rollout)
@@ -1249,7 +1338,7 @@ class Player0Planner:
                     opp = state.players[pid]
                     test_concealed = opp.concealed.copy()
                     test_concealed.append(tile)
-                    if is_winning_hand_with_exposed(test_concealed, opp.exposed):
+                    if is_winning_concealed_only(test_concealed):
                         # Opponent wins on discard; if P0 was the discarder, this is a -1.
                         reward = -1.0 if discarder == 0 else 0.0
                         return reward, True, "OPP_RON"
@@ -1304,7 +1393,7 @@ class Player0Planner:
             # Leaf node: rollout value + heuristic shaping
             v = simulate_random_game(state)
             p0 = state.players[0]
-            v += self.shaping_alpha * hand_progress(p0)
+            v += self.shaping_alpha * hand_progress(p0, state)
             return v
 
         actions = self.get_actions(state, reacting)
@@ -1316,6 +1405,12 @@ class Player0Planner:
             for a in actions:
                 node.N_a[a] = 0
                 node.Q_a[a] = 0.0
+        else:
+            # On subsequent visits, initialize any new actions that weren't available before
+            for a in actions:
+                if a not in node.N_a:
+                    node.N_a[a] = 0
+                    node.Q_a[a] = 0.0
 
         # Select action with UCB
         action = self.select_ucb(node, actions)
@@ -1490,7 +1585,7 @@ def apply_chow(state: GameState, caller_idx: int, seq: List[str], tile: str, dis
 
 def ai_wants_pung_gong(player_idx: int, opts: List[str]) -> Optional[str]:
     """Determine if AI player wants to call pung/gong (prefer gong if both available)."""
-    if player_idx in (1, 2, 3):
+    if player_idx in (1, 3):
         if "gong" in opts:
             return "gong"
         if "pung" in opts:
@@ -1516,7 +1611,7 @@ def handle_calls_after_discard(state: GameState, discarder_idx: int, tile: str) 
         # Check for win on discard
         test_concealed = p0.concealed.copy()
         test_concealed.append(tile)
-        if is_winning_hand_with_exposed(test_concealed, p0.exposed):
+        if is_winning_concealed_only(test_concealed):
             has_meaningful_action = True
         
         # Check for pung/gong
@@ -1596,7 +1691,7 @@ def handle_calls_after_discard(state: GameState, discarder_idx: int, tile: str) 
         test_concealed = player.concealed.copy()
         test_concealed.append(tile)
 
-        if is_winning_hand_with_exposed(test_concealed, player.exposed):
+        if is_winning_concealed_only(test_concealed):
             # AI players always take win
             print(f"\nPlayer {idx} ({player.name}) (AI) wins by taking {tile}!")
             player.concealed.append(tile)
@@ -1640,10 +1735,9 @@ def handle_calls_after_discard(state: GameState, discarder_idx: int, tile: str) 
             apply_pung(state, chosen_player, tile, discarder_idx)
             render_state(state)
             # caller discards immediately (no draw)
+            # player 2 never pungs
             if chosen_player == 1:
                 ai1_discard_random(state, chosen_player)
-            elif chosen_player == 2:
-                ai2_discard_wind_dragon_then_isolated(state, chosen_player)
             elif chosen_player == 3:
                 ai3_discard_most_seen(state, chosen_player)
             # Handle calls on the new discard recursively
@@ -1653,10 +1747,9 @@ def handle_calls_after_discard(state: GameState, discarder_idx: int, tile: str) 
             apply_gong(state, chosen_player, tile, discarder_idx)
             render_state(state)
             # after gong + supplement draw, caller must discard
+            # player 2 never gongs
             if chosen_player == 1:
                 ai1_discard_random(state, chosen_player)
-            elif chosen_player == 2:
-                ai2_discard_wind_dragon_then_isolated(state, chosen_player)
             elif chosen_player == 3:
                 ai3_discard_most_seen(state, chosen_player)
             # Handle calls on the new discard recursively
@@ -1832,8 +1925,8 @@ def player_turn(state: GameState):
 
     # -------- Other players: heuristic AIs --------
 
-    # Check self-draw win (tsumo) using concealed + exposed
-    if is_winning_hand_with_exposed(player.concealed, player.exposed):
+    # Check self-draw win (tsumo) using concealed only
+    if is_winning_concealed_only(player.concealed):
         # Other AIs always take self-draw win
         tiles_for_win = player.concealed
         log_action(state, pidx, "win", {"hand": sort_tiles(tiles_for_win)})
